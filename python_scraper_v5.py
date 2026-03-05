@@ -350,6 +350,7 @@ class ExcelPDFScraper:
             'success_bibcite': 0,
             'success_pubmed': 0,
             'success_abstract_txt': 0,
+            'abstracts_deleted': 0,
             'failed': 0,
             'skipped': 0,
             'duplicates': 0,
@@ -358,8 +359,31 @@ class ExcelPDFScraper:
         }
 
     def is_already_downloaded(self, row):
+        """Check if a PDF was successfully downloaded (excludes abstracts)."""
         return (pd.notna(row.get('download_status')) and
-                row.get('download_status') in ('success_bibcite', 'success_pubmed', 'success_abstract_txt'))
+                row.get('download_status') in ('success_bibcite', 'success_pubmed'))
+
+    def delete_abstract_if_exists(self, nid, title=None):
+        """Delete abstract .txt file if it exists. Returns True if deleted."""
+        # Try to construct the abstract filename the same way save_abstract_txt does
+        if title and str(title).strip():
+            clean_title = re.sub(r'[^\w\s-]', '', str(title).strip())
+            clean_title = re.sub(r'[\s]+', '_', clean_title).strip('_')[:150]
+            filename = f"nid_{nid}_{clean_title}.txt"
+        else:
+            filename = f"nid_{nid}_abstract.txt"
+        
+        filepath = os.path.join(self.abstract_dir, filename)
+        
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                self.stats['abstracts_deleted'] += 1
+                return True
+            except Exception as e:
+                print(f"  ⚠️ Could not delete abstract: {str(e)[:50]}")
+                return False
+        return False
 
     def _valid_url(self, val):
         if pd.isna(val) or not val or str(val).strip() == '':
@@ -381,30 +405,46 @@ class ExcelPDFScraper:
             self.stats['pmc_downloads'] += 1
             success, message = self.pmc_downloader.download(url, filepath)
             if not success:
-                return 'failed', None, f'PMC: {message}'
+                return 'failed', None, f'PMC: {message} (URL: {url[:100]})'
         else:
             pdf_url = self.universal_finder.find_pdf(url)
             if not pdf_url:
-                return 'failed', None, 'Could not find PDF URL'
+                return 'failed', None, f'Could not find PDF URL on page (Source URL: {url[:100]})'
             try:
                 response = self.universal_finder.session.get(pdf_url, timeout=30, stream=True)
                 response.raise_for_status()
+                
+                # Check content type
+                content_type = response.headers.get('Content-Type', 'unknown')
+                if 'html' in content_type.lower() and 'pdf' not in content_type.lower():
+                    return 'failed', None, f'Received HTML instead of PDF (Content-Type: {content_type}, URL: {pdf_url[:100]})'
+                
                 with open(filepath, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
+                        
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code if e.response else 'unknown'
+                return 'failed', None, f'HTTP {status_code} error: {str(e)[:100]} (URL: {pdf_url[:100]})'
+            except requests.exceptions.Timeout:
+                return 'failed', None, f'Request timeout after 30s (URL: {pdf_url[:100]})'
+            except requests.exceptions.ConnectionError as e:
+                return 'failed', None, f'Connection error: {str(e)[:100]} (URL: {pdf_url[:100]})'
             except Exception as e:
-                return 'failed', None, f'Download error: {str(e)[:100]}'
+                error_type = type(e).__name__
+                return 'failed', None, f'{error_type}: {str(e)[:100]} (URL: {pdf_url[:100]})'
 
         is_valid, validation_msg = self.validator.validate_pdf(filepath)
         if not is_valid:
+            file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
             if os.path.exists(filepath):
                 os.remove(filepath)
-            return 'corrupt', None, f'Invalid PDF: {validation_msg}'
+            return 'corrupt', None, f'Invalid PDF: {validation_msg} (Size: {file_size} bytes, URL: {url[:100]})'
 
         file_hash = self.validator.get_file_hash(filepath)
         if file_hash in self.downloaded_hashes:
             os.remove(filepath)
-            return 'duplicate', None, 'Duplicate file'
+            return 'duplicate', None, f'Duplicate file (MD5: {file_hash[:8]}...)'
 
         self.downloaded_hashes.add(file_hash)
         file_size = os.path.getsize(filepath) / 1024
@@ -426,16 +466,43 @@ class ExcelPDFScraper:
             return 'success_abstract_txt', filepath, f'Abstract saved as TXT ({file_size} bytes)'
         except Exception as e:
             return 'failed', None, f'Could not save abstract: {str(e)[:100]}'
+    
+    def delete_abstract_file(self, nid, title=None):
+        """Delete abstract.txt file if it exists (from previous run)."""
+        # Try both filename patterns
+        if title and str(title).strip():
+            clean_title = re.sub(r'[^\w\s-]', '', str(title).strip())
+            clean_title = re.sub(r'[\s]+', '_', clean_title).strip('_')[:150]
+            filename1 = f"nid_{nid}_{clean_title}.txt"
+        else:
+            filename1 = f"nid_{nid}_abstract.txt"
+        
+        filename2 = f"nid_{nid}_abstract.txt"  # Fallback pattern
+        
+        deleted = False
+        for filename in [filename1, filename2]:
+            filepath = os.path.join(self.abstract_dir, filename)
+            if os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                    deleted = True
+                    self.stats['abstracts_deleted'] += 1
+                    print(f"  🗑️  Deleted previous abstract: {filename}")
+                except Exception as e:
+                    print(f"  ⚠️  Could not delete {filename}: {str(e)[:50]}")
+        
+        return deleted
 
     def process_row(self, row):
         """
         Process one row with fallback chain.
-        Returns: (status, filepath, url_used, source_used, message)
+        Returns: (status, filepath, url_used, source_used, message, detailed_errors)
         """
         # Already done?
         if self.is_already_downloaded(row):
             return (row.get('download_status'), row.get('download_filepath'),
-                    row.get('url_used', ''), row.get('source_used', ''), 'Previously downloaded')
+                    row.get('url_used', ''), row.get('source_used', ''), 
+                    'Previously downloaded', row.get('detailed_errors', ''))
 
         nid = row.get('Node ID')
         title = row.get('Title')
@@ -444,21 +511,31 @@ class ExcelPDFScraper:
         abstract = row.get('Abstract (English)')
         has_abstract = pd.notna(abstract) and str(abstract).strip() != ''
 
+        # Track all errors from each source
+        error_log = []
+
         # ── Step 1: Bibcite URL ──────────────────────────────────────────────
         if bibcite_url:
             if bibcite_url in self.processed_urls:
                 self.stats['duplicate_urls'] += 1
+                error_log.append(f"Bibcite: Duplicate URL (already processed)")
                 # Still try pubmed
             else:
                 self.processed_urls.add(bibcite_url)
                 status, filepath, msg = self.download_pdf(bibcite_url, nid, title=title)
                 if status == 'success':
                     self.stats['success_bibcite'] += 1
-                    return 'success_bibcite', filepath, bibcite_url, 'Bibcite URL', msg
+                    # Delete abstract file if it exists from previous run
+                    self.delete_abstract_file(nid, title)
+                    return 'success_bibcite', filepath, bibcite_url, 'Bibcite URL', msg, ''
                 elif status == 'duplicate':
                     self.stats['duplicates'] += 1
-                    return 'duplicate', filepath, bibcite_url, 'Bibcite URL', msg
-                # else: failed/corrupt → try next
+                    return 'duplicate', filepath, bibcite_url, 'Bibcite URL', msg, ''
+                else:
+                    # Failed or corrupt - log the error
+                    error_log.append(f"Bibcite: {msg}")
+        else:
+            error_log.append("Bibcite: No URL provided")
 
         # ── Step 2: PubMed URL ───────────────────────────────────────────────
         if pubmed_url:
@@ -467,32 +544,41 @@ class ExcelPDFScraper:
                 status, filepath, msg = self.download_pdf(pubmed_url, nid, title=title)
                 if status == 'success':
                     self.stats['success_pubmed'] += 1
-                    return 'success_pubmed', filepath, pubmed_url, 'PubMed URL', msg
+                    detailed_errors = ' | '.join(error_log) if error_log else ''
+                    # Delete abstract file if it exists from previous run
+                    self.delete_abstract_file(nid, title)
+                    return 'success_pubmed', filepath, pubmed_url, 'PubMed URL', msg, detailed_errors
                 elif status == 'duplicate':
                     self.stats['duplicates'] += 1
-                    return 'duplicate', filepath, pubmed_url, 'PubMed URL', msg
-                # else: failed/corrupt → try abstract
+                    detailed_errors = ' | '.join(error_log) if error_log else ''
+                    return 'duplicate', filepath, pubmed_url, 'PubMed URL', msg, detailed_errors
+                else:
+                    # Failed or corrupt
+                    error_log.append(f"PubMed: {msg}")
+            else:
+                error_log.append("PubMed: Duplicate URL (already processed)")
+        else:
+            error_log.append("PubMed: No URL provided")
 
         # ── Step 3: Abstract as .txt ─────────────────────────────────────────
         if has_abstract:
             status, filepath, msg = self.save_abstract_txt(nid, abstract, title=title)
+            detailed_errors = ' | '.join(error_log) if error_log else ''
             if status == 'success_abstract_txt':
                 self.stats['success_abstract_txt'] += 1
-                return 'success_abstract_txt', filepath, '', 'Abstract (English)', msg
+                return 'success_abstract_txt', filepath, '', 'Abstract (English)', msg, detailed_errors
             else:
                 self.stats['failed'] += 1
-                return status, None, '', 'Abstract (English)', msg
+                error_log.append(f"Abstract: {msg}")
+                detailed_errors = ' | '.join(error_log)
+                return status, None, '', 'Abstract (English)', msg, detailed_errors
+        else:
+            error_log.append("Abstract: No abstract text available")
 
         # ── Nothing worked ───────────────────────────────────────────────────
         self.stats['skipped'] += 1
-        reasons = []
-        if not bibcite_url:
-            reasons.append('no Bibcite URL')
-        if not pubmed_url:
-            reasons.append('no PubMed URL')
-        if not has_abstract:
-            reasons.append('no Abstract')
-        return 'skipped', None, '', 'none', '; '.join(reasons) or 'No data available'
+        detailed_errors = ' | '.join(error_log)
+        return 'skipped', None, '', 'none', 'No data available', detailed_errors
 
     def process_excel_file(self, input_file, output_file=None):
         print(f"\n{'='*80}")
@@ -527,7 +613,7 @@ class ExcelPDFScraper:
 
         # Initialize / ensure output columns
         for col in ['download_status', 'download_filepath', 'download_filename', 'url_used',
-                    'source_used', 'download_error', 'download_timestamp']:
+                    'source_used', 'download_error', 'detailed_errors', 'download_timestamp']:
             if col not in df.columns:
                 df[col] = ''
 
@@ -561,7 +647,7 @@ class ExcelPDFScraper:
             bibcite = str(row.get('Bibcite URL', ''))[:50]
             print(f"[{processed}/{len(infontd_df)}] NID {nid}: {bibcite}...")
 
-            status, filepath, url_used, source_used, message = self.process_row(row)
+            status, filepath, url_used, source_used, message, detailed_errors = self.process_row(row)
 
             if status in ('already_downloaded',):
                 self.stats['already_downloaded'] += 1
@@ -579,6 +665,7 @@ class ExcelPDFScraper:
             df.at[idx, 'url_used'] = url_used
             df.at[idx, 'source_used'] = source_used
             df.at[idx, 'download_error'] = message
+            df.at[idx, 'detailed_errors'] = detailed_errors
             df.at[idx, 'download_timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             rows_updated += 1
 
@@ -654,6 +741,8 @@ class ExcelPDFScraper:
         print(f"  ✓ Bibcite PDF:   {self.stats['success_bibcite']}")
         print(f"  ✓ PubMed PDF:    {self.stats['success_pubmed']}")
         print(f"  ✓ Abstract TXT:  {self.stats['success_abstract_txt']}")
+        if self.stats['abstracts_deleted']:
+            print(f"  🗑️  Abstracts deleted (replaced with PDFs): {self.stats['abstracts_deleted']}")
         print(f"  ⊙ Duplicates:    {self.stats['duplicates']}")
         print(f"  ✗ Failed:        {self.stats['failed']}")
         print(f"  ○ Skipped:       {self.stats['skipped']} (no data at all)")
@@ -670,6 +759,7 @@ class ExcelPDFScraper:
         print(f"  download_filename — filename only, e.g. nid_123_article.pdf")
         print(f"  download_filepath — full local path to the saved file")
         print(f"  download_error    — details / error message")
+        print(f"  detailed_errors   — all errors from each source attempted (Bibcite | PubMed | Abstract)")
         print(f"  download_timestamp")
         print(f"\n{'='*80}\n")
 

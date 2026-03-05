@@ -9,3 +9,11 @@ openpyxl>=3.1.0
 
 # Optional: For better HTML parsing
 lxml>=4.9.0
+
+playwright
+# Run this command after installing Playwright to download the necessary browser binaries:
+# python -m playwright install chromium
+
+free-proxy
+stem
+ 
